@@ -47,10 +47,13 @@ const TOP_Y = 26;           // Y of topmost platform line
 const BOTTOM_Y = TOP_Y + NUM_FLOORS * PLATFORM_SPACING; // ground floor
 const JACK_W = 8;
 const HOLE_WIDTH = 18;
+const MAX_HOLES = 8;        // max holes on screen total per platform
 const MOVE_SPEED = 1.2;
 const JUMP_FRAMES = 10;
 const BONK_FRAMES = 14;     // head bonk: up halfway then back
-const STUN_FRAMES = 50;
+const STUN_FALL = 25;       // stun from falling through hole (~0.7s)
+const STUN_BONK = 70;       // stun from head bang (~2.1s)
+const STUN_HAZARD = 45;     // stun from hazard hit (~1.4s)
 const FALL_FRAMES = 8;
 
 // ZX Spectrum palette
@@ -227,12 +230,24 @@ function startGame() {
 function update() {
   if (gameState !== 'playing') return;
 
-  // Move holes
+  // Move holes - holes migrate between floors when wrapping
   for (let p = 0; p < NUM_FLOORS; p++) {
-    for (const h of holes[p]) {
+    for (let i = holes[p].length - 1; i >= 0; i--) {
+      const h = holes[p][i];
       h.x += h.speed;
-      if (h.x > W) h.x = -HOLE_WIDTH;
-      if (h.x < -HOLE_WIDTH) h.x = W;
+      if (h.speed > 0 && h.x > W) {
+        // Moving right, wraps to left side and moves DOWN one floor
+        holes[p].splice(i, 1);
+        const newFloor = (p + 1) % NUM_FLOORS;
+        h.x = -HOLE_WIDTH;
+        holes[newFloor].push(h);
+      } else if (h.speed < 0 && h.x < -HOLE_WIDTH) {
+        // Moving left, wraps to right side and moves UP one floor
+        holes[p].splice(i, 1);
+        const newFloor = (p - 1 + NUM_FLOORS) % NUM_FLOORS;
+        h.x = W;
+        holes[newFloor].push(h);
+      }
     }
   }
 
@@ -277,8 +292,16 @@ function update() {
           gameState = 'levelcomplete';
           score += 100 * level;
           sfxLevel();
-          setTimeout(() => { level++; initLevel(); gameState = 'playing'; }, 2500);
+          setTimeout(() => {
+            level++;
+            // Bonus life every 5 levels (like original)
+            if (level % 5 === 1 && level > 1) lives++;
+            initLevel();
+            gameState = 'playing';
+          }, 2500);
         } else {
+          // Every jump spawns a new hole on a random floor (up to MAX_HOLES per floor)
+          spawnHoleOnJump();
           const above = jack.floor - 1;
           if (holeOverlap(jack.x, above)) {
             // Jump through hole
@@ -308,14 +331,14 @@ function update() {
       if (jack.timer >= JUMP_FRAMES) {
         jack.floor = jack.toFloor;
         jack.state = 'walk';
-        score += 10;
+        score += 5 * (1 + level); // scales with level like original
       }
       break;
 
     case 'bonk':
       jack.timer++;
       if (jack.timer >= BONK_FRAMES) {
-        jack.state = 'stun'; jack.timer = STUN_FRAMES;
+        jack.state = 'stun'; jack.timer = STUN_BONK;
         jack.floor = jack.fromFloor;
       }
       break;
@@ -324,18 +347,25 @@ function update() {
       jack.timer++;
       if (jack.timer >= FALL_FRAMES) {
         jack.floor = jack.toFloor;
-        // Chain falls
+        // Chain falls - if still over a hole, keep falling
         if (jack.floor > 0 && jack.floor < NUM_FLOORS && holeOverlap(jack.x, jack.floor)) {
           jack.timer = 0;
           jack.fromFloor = jack.floor; jack.toFloor = jack.floor + 1;
         } else {
-          jack.state = 'walk';
+          jack.state = 'stun'; jack.timer = STUN_FALL;
         }
       }
       break;
 
     case 'stun':
       jack.timer--;
+      // Holes can scroll under stunned Jack and make him fall
+      if (jack.floor > 0 && jack.floor < NUM_FLOORS && holeOverlap(jack.x, jack.floor)) {
+        jack.state = 'fall'; jack.timer = 0;
+        jack.fromFloor = jack.floor; jack.toFloor = jack.floor + 1;
+        sfxFall();
+        break;
+      }
       if (jack.timer <= 0) jack.state = 'walk';
       break;
   }
@@ -348,7 +378,18 @@ function jackHit() {
     gameState = 'gameover';
     if (score > highScore) highScore = score;
   } else {
-    jack.state = 'stun'; jack.timer = STUN_FRAMES;
+    jack.state = 'stun'; jack.timer = STUN_HAZARD;
+  }
+}
+
+function spawnHoleOnJump() {
+  // Each jump creates a new hole on a random floor (faithful to original)
+  const targetFloor = Math.floor(Math.random() * NUM_FLOORS);
+  if (holes[targetFloor].length < MAX_HOLES) {
+    holes[targetFloor].push({
+      x: Math.random() * (W - HOLE_WIDTH),
+      speed: (0.25 + Math.random() * 0.5 + level * 0.05) * (Math.random() < 0.5 ? 1 : -1),
+    });
   }
 }
 
