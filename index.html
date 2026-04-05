@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jumping Jack - ZX Spectrum Clone</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: monospace;
+  }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ============================================================
+// JUMPING JACK - ZX Spectrum Clone
+// Original by Albert Ball, 1983 (Imagine Software)
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ZX Spectrum resolution: 256x192, scaled up
+const SCALE = 3;
+const W = 256;
+const H = 192;
+canvas.width = W * SCALE;
+canvas.height = H * SCALE;
+ctx.imageSmoothingEnabled = false;
+
+// Game constants
+const NUM_FLOORS = 8;       // 8 platforms (lines) Jack can stand on
+const PLATFORM_SPACING = 18;
+const TOP_Y = 26;           // Y of topmost platform line
+const BOTTOM_Y = TOP_Y + NUM_FLOORS * PLATFORM_SPACING; // ground floor
+const JACK_W = 8;
+const HOLE_WIDTH = 18;
+const MOVE_SPEED = 1.2;
+const JUMP_FRAMES = 10;
+const BONK_FRAMES = 14;     // head bonk: up halfway then back
+const STUN_FRAMES = 50;
+const FALL_FRAMES = 8;
+
+// ZX Spectrum palette
+const COL = {
+  BLACK:   '#000000',
+  BLUE:    '#0000D7', RED:     '#D70000', MAGENTA: '#D700D7',
+  GREEN:   '#00D700', CYAN:    '#00D7D7', YELLOW:  '#D7D700',
+  WHITE:   '#D7D7D7',
+  BWHITE:  '#FFFFFF', BYELLOW: '#FFFF00', BGREEN:  '#00FF00',
+  BCYAN:   '#00FFFF', BRED:    '#FF0000', BMAGENTA:'#FF00FF',
+  BBLUE:   '#0000FF',
+};
+
+const PLAT_COLORS = [
+  COL.BRED, COL.BYELLOW, COL.BGREEN, COL.BCYAN,
+  COL.BMAGENTA, COL.BBLUE, COL.BWHITE, COL.BRED
+];
+
+// ---- Audio (simple Web Audio beeps) ----
+let audioCtx;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function beep(freq, dur, vol) {
+  try {
+    ensureAudio();
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'square';
+    o.frequency.value = freq;
+    g.gain.value = vol || 0.08;
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch(e) {}
+}
+function sfxJump()  { beep(600, 0.08); beep(900, 0.08); }
+function sfxBonk()  { beep(150, 0.15, 0.12); }
+function sfxFall()  { beep(300, 0.06); setTimeout(() => beep(200, 0.06), 60); }
+function sfxDie()   { beep(200, 0.3, 0.1); setTimeout(() => beep(100, 0.3, 0.1), 150); }
+function sfxLevel() { [0,100,200,300].forEach((d,i) => setTimeout(() => beep(800+i*200, 0.1), d)); }
+
+// ---- Game State ----
+let gameState = 'title';
+let score = 0, lives = 5, level = 1, highScore = 0;
+let jumpPressed = false; // edge-detect for jump
+
+const jack = {
+  x: 128, floor: NUM_FLOORS,
+  state: 'walk', dir: 1,
+  timer: 0, fromFloor: 0, toFloor: 0,
+  animFrame: 0, animClock: 0,
+};
+
+let holes = [];   // holes[platformIndex] = [{x, speed}, ...]
+let hazards = [];
+
+// ---- Input ----
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  if (e.code === 'Space' || e.code === 'Enter') {
+    if (gameState === 'title') startGame();
+    else if (gameState === 'gameover') gameState = 'title';
+  }
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Touch
+let touchL = false, touchR = false, touchJ = false;
+canvas.addEventListener('touchstart', onTouch, {passive:false});
+canvas.addEventListener('touchmove', onTouch, {passive:false});
+canvas.addEventListener('touchend', e => {
+  e.preventDefault(); touchL = touchR = touchJ = false;
+  if (gameState === 'title') startGame();
+  if (gameState === 'gameover') gameState = 'title';
+}, {passive:false});
+function onTouch(e) {
+  e.preventDefault(); touchL = touchR = touchJ = false;
+  for (const t of e.touches) {
+    const r = canvas.getBoundingClientRect();
+    const rx = (t.clientX - r.left) / r.width;
+    const ry = (t.clientY - r.top) / r.height;
+    if (ry < 0.4) touchJ = true;
+    else if (rx < 0.35) touchL = true;
+    else if (rx > 0.65) touchR = true;
+  }
+}
+
+// ---- Helpers ----
+function platY(floor) {
+  return TOP_Y + floor * PLATFORM_SPACING;
+}
+
+function jackY() {
+  const from = platY(jack.fromFloor);
+  const to   = platY(jack.toFloor);
+  if (jack.state === 'jump') {
+    const t = jack.timer / JUMP_FRAMES;
+    return from + (to - from) * t;
+  }
+  if (jack.state === 'bonk') {
+    // go halfway up toward platform above, then come back
+    const half = BONK_FRAMES / 2;
+    const mid = from - PLATFORM_SPACING * 0.45;
+    if (jack.timer <= half) {
+      const t = jack.timer / half;
+      return from + (mid - from) * t;
+    } else {
+      const t = (jack.timer - half) / half;
+      return mid + (from - mid) * t;
+    }
+  }
+  if (jack.state === 'fall') {
+    const t = jack.timer / FALL_FRAMES;
+    return from + (to - from) * t;
+  }
+  return platY(jack.floor);
+}
+
+function holeOverlap(x, platIdx) {
+  if (platIdx < 0 || platIdx >= NUM_FLOORS) return false;
+  const jl = x - JACK_W / 2, jr = x + JACK_W / 2;
+  for (const h of holes[platIdx]) {
+    if (jr > h.x + 4 && jl < h.x + HOLE_WIDTH - 4) return true;
+  }
+  return false;
+}
+
+// ---- Init ----
+function initLevel() {
+  jack.x = 128;
+  jack.floor = NUM_FLOORS;
+  jack.state = 'walk';
+  jack.dir = 1;
+  jack.timer = 0;
+
+  // Holes: more at higher levels, varying speeds
+  holes = [];
+  const base = Math.min(1 + Math.floor((level - 1) / 2), 4);
+  for (let p = 0; p < NUM_FLOORS; p++) {
+    holes[p] = [];
+    const n = Math.min(base + (p % 2), 5);
+    for (let i = 0; i < n; i++) {
+      holes[p].push({
+        x: Math.random() * (W - HOLE_WIDTH),
+        speed: (0.25 + Math.random() * 0.5 + level * 0.05) * (Math.random() < 0.5 ? 1 : -1),
+      });
+    }
+  }
+
+  // Hazards from level 2+
+  hazards = [];
+  const nh = Math.min(level - 1, 6);
+  for (let i = 0; i < nh; i++) {
+    hazards.push({
+      x: Math.random() * W,
+      floor: 1 + Math.floor(Math.random() * (NUM_FLOORS - 1)),
+      speed: (0.3 + Math.random() * 0.5 + level * 0.05) * (Math.random() < 0.5 ? 1 : -1),
+      kind: i % 3,
+    });
+  }
+}
+
+function startGame() {
+  ensureAudio();
+  gameState = 'playing';
+  score = 0; lives = 5; level = 1;
+  initLevel();
+}
+
+// ---- Update ----
+function update() {
+  if (gameState !== 'playing') return;
+
+  // Move holes
+  for (let p = 0; p < NUM_FLOORS; p++) {
+    for (const h of holes[p]) {
+      h.x += h.speed;
+      if (h.x > W) h.x = -HOLE_WIDTH;
+      if (h.x < -HOLE_WIDTH) h.x = W;
+    }
+  }
+
+  // Move hazards
+  for (const hz of hazards) {
+    hz.x += hz.speed;
+    if (hz.x > W + 10) hz.x = -10;
+    if (hz.x < -10) hz.x = W + 10;
+  }
+
+  // Animate Jack
+  jack.animClock++;
+  if (jack.animClock >= 6) { jack.animClock = 0; jack.animFrame = (jack.animFrame + 1) % 4; }
+
+  // Detect jump press edge
+  const wantJump = keys['Space'] || keys['ArrowUp'] || touchJ;
+  const jumpEdge = wantJump && !jumpPressed;
+  jumpPressed = wantJump;
+
+  switch (jack.state) {
+    case 'walk': {
+      // Movement
+      if (keys['ArrowLeft'] || touchL) { jack.x -= MOVE_SPEED; jack.dir = -1; }
+      if (keys['ArrowRight'] || touchR) { jack.x += MOVE_SPEED; jack.dir = 1; }
+      // Wrap
+      if (jack.x < 0) jack.x += W;
+      if (jack.x > W) jack.x -= W;
+
+      // Fall through hole on current platform
+      if (jack.floor > 0 && jack.floor < NUM_FLOORS && holeOverlap(jack.x, jack.floor)) {
+        jack.state = 'fall'; jack.timer = 0;
+        jack.fromFloor = jack.floor; jack.toFloor = jack.floor + 1;
+        sfxFall();
+        break;
+      }
+
+      // Jump
+      if (jumpEdge) {
+        if (jack.floor === 0) {
+          // On top platform - escape = level complete!
+          jack.state = 'celebrate';
+          gameState = 'levelcomplete';
+          score += 100 * level;
+          sfxLevel();
+          setTimeout(() => { level++; initLevel(); gameState = 'playing'; }, 2500);
+        } else {
+          const above = jack.floor - 1;
+          if (holeOverlap(jack.x, above)) {
+            // Jump through hole
+            jack.state = 'jump'; jack.timer = 0;
+            jack.fromFloor = jack.floor; jack.toFloor = above;
+            sfxJump();
+          } else {
+            // Bonk head
+            jack.state = 'bonk'; jack.timer = 0;
+            jack.fromFloor = jack.floor; jack.toFloor = jack.floor;
+            sfxBonk();
+          }
+        }
+      }
+
+      // Hazard collision
+      for (const hz of hazards) {
+        if (hz.floor === jack.floor && Math.abs(hz.x - jack.x) < 8) {
+          jackHit(); break;
+        }
+      }
+      break;
+    }
+
+    case 'jump':
+      jack.timer++;
+      if (jack.timer >= JUMP_FRAMES) {
+        jack.floor = jack.toFloor;
+        jack.state = 'walk';
+        score += 10;
+      }
+      break;
+
+    case 'bonk':
+      jack.timer++;
+      if (jack.timer >= BONK_FRAMES) {
+        jack.state = 'stun'; jack.timer = STUN_FRAMES;
+        jack.floor = jack.fromFloor;
+      }
+      break;
+
+    case 'fall':
+      jack.timer++;
+      if (jack.timer >= FALL_FRAMES) {
+        jack.floor = jack.toFloor;
+        // Chain falls
+        if (jack.floor > 0 && jack.floor < NUM_FLOORS && holeOverlap(jack.x, jack.floor)) {
+          jack.timer = 0;
+          jack.fromFloor = jack.floor; jack.toFloor = jack.floor + 1;
+        } else {
+          jack.state = 'walk';
+        }
+      }
+      break;
+
+    case 'stun':
+      jack.timer--;
+      if (jack.timer <= 0) jack.state = 'walk';
+      break;
+  }
+}
+
+function jackHit() {
+  lives--;
+  sfxDie();
+  if (lives <= 0) {
+    gameState = 'gameover';
+    if (score > highScore) highScore = score;
+  } else {
+    jack.state = 'stun'; jack.timer = STUN_FRAMES;
+  }
+}
+
+// ---- Drawing ----
+function px(x, y, c) {
+  ctx.fillStyle = c;
+  ctx.fillRect(x * SCALE, y * SCALE, SCALE, SCALE);
+}
+function rect(x, y, w, h, c) {
+  ctx.fillStyle = c;
+  ctx.fillRect(Math.round(x * SCALE), Math.round(y * SCALE),
+               Math.round(w * SCALE), Math.round(h * SCALE));
+}
+function text(str, x, y, c, sz) {
+  ctx.fillStyle = c || COL.WHITE;
+  ctx.font = `bold ${(sz || 8) * SCALE}px monospace`;
+  ctx.textAlign = 'left';
+  ctx.fillText(str, x * SCALE, y * SCALE);
+}
+function textC(str, y, c, sz) {
+  ctx.fillStyle = c || COL.WHITE;
+  ctx.font = `bold ${(sz || 8) * SCALE}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText(str, (W/2) * SCALE, y * SCALE);
+}
+
+function drawJack(cx, cy) {
+  const stunned = jack.state === 'stun';
+  const skin = stunned ? COL.YELLOW : COL.BWHITE;
+  const f = jack.dir;
+  const fr = jack.animFrame;
+  const jumping = jack.state === 'jump' || jack.state === 'bonk';
+  const falling = jack.state === 'fall';
+
+  // Head
+  rect(cx-3, cy-15, 7, 6, skin);
+  // Hair
+  rect(cx-3, cy-16, 7, 2, COL.BLACK);
+  rect(cx-2, cy-16, 5, 1, COL.BYELLOW);
+  // Eyes
+  const ex = f > 0 ? 1 : -1;
+  px(cx-1+ex, cy-13, COL.BLACK);
+  px(cx+1+ex, cy-13, COL.BLACK);
+  // Mouth
+  if (stunned) {
+    px(cx, cy-11, COL.BLACK);
+  } else {
+    rect(cx-1, cy-11, 3, 1, COL.BRED);
+  }
+
+  // Stun stars
+  if (stunned) {
+    const phase = (jack.timer * 0.2) % (Math.PI * 2);
+    for (let i = 0; i < 4; i++) {
+      const a = phase + i * Math.PI / 2;
+      const sx = cx + Math.cos(a) * 8;
+      const sy = cy - 13 + Math.sin(a) * 5;
+      px(Math.floor(sx), Math.floor(sy), COL.BYELLOW);
+      px(Math.floor(sx)+1, Math.floor(sy), COL.BYELLOW);
+    }
+  }
+
+  // Body (shirt)
+  rect(cx-3, cy-9, 7, 6, COL.BRED);
+
+  // Arms
+  if (jumping) {
+    rect(cx-5, cy-14, 2, 5, skin);
+    rect(cx+4, cy-14, 2, 5, skin);
+  } else if (falling) {
+    rect(cx-5, cy-10, 2, 5, skin);
+    rect(cx+4, cy-10, 2, 5, skin);
+  } else {
+    rect(cx-5, cy-8, 2, 5, skin);
+    rect(cx+4, cy-8, 2, 5, skin);
+  }
+
+  // Legs
+  if (jumping || falling) {
+    rect(cx-2, cy-3, 3, 3, COL.BBLUE);
+    rect(cx+0, cy-3, 3, 3, COL.BBLUE);
+  } else {
+    const spread = [0, 2, 0, -1][fr];
+    rect(cx-2-spread, cy-3, 3, 3, COL.BBLUE);
+    rect(cx+spread,   cy-3, 3, 3, COL.BBLUE);
+  }
+
+  // Shoes
+  rect(cx-3, cy, 3, 1, COL.BLACK);
+  rect(cx+1, cy, 3, 1, COL.BLACK);
+}
+
+function drawHazard(hz) {
+  const x = Math.floor(hz.x);
+  const y = platY(hz.floor);
+  const colors = [COL.BGREEN, COL.BMAGENTA, COL.BCYAN];
+  const c = colors[hz.kind];
+  const animOff = Math.sin(Date.now() / 200 + hz.x) > 0 ? 1 : 0;
+
+  if (hz.kind === 0) {
+    // Ghost/monster
+    rect(x-3, y-10+animOff, 7, 7, c);
+    rect(x-4, y-8, 1, 4, c);
+    rect(x+4, y-8, 1, 4, c);
+    px(x-1, y-8, COL.BLACK); px(x+2, y-8, COL.BLACK); // eyes
+    rect(x-3, y-3, 2, 2, c); rect(x+2, y-3, 2, 2, c); // feet
+  } else if (hz.kind === 1) {
+    // Spinning thing
+    const d = hz.speed > 0 ? 1 : -1;
+    rect(x-5*d, y-5, 10, 2, c);
+    px(x+4*d, y-7, c); px(x+5*d, y-6, c);
+    px(x+4*d, y-2, c); px(x+5*d, y-3, c);
+  } else {
+    // Little car
+    rect(x-5, y-7+animOff, 11, 5, c);
+    rect(x-3, y-9, 7, 2, c);
+    rect(x-4, y-2, 3, 2, COL.WHITE);
+    rect(x+2, y-2, 3, 2, COL.WHITE);
+    px(x-4, y-2, COL.BLACK); px(x+4, y-2, COL.BLACK); // axles
+  }
+}
+
+function render() {
+  rect(0, 0, W, H, COL.BLACK);
+
+  if (gameState === 'title') return drawTitle();
+  if (gameState === 'gameover') return drawGameOver();
+
+  // HUD
+  text('SCORE:' + String(score).padStart(6,'0'), 2, 10, COL.BYELLOW, 7);
+  text('HI:' + String(highScore).padStart(6,'0'), 100, 10, COL.WHITE, 7);
+  text('LIVES:' + lives, 175, 10, COL.BGREEN, 7);
+  text('LV' + level, 235, 10, COL.BCYAN, 7);
+
+  // "ESCAPE" zone indicator at top
+  rect(0, TOP_Y - 4, W, 3, COL.BYELLOW);
+  textC('ESCAPE!', TOP_Y - 1, COL.BLACK, 5);
+  rect(0, TOP_Y - 4, W, 1, COL.BWHITE);
+
+  // Platforms with holes
+  for (let p = 0; p < NUM_FLOORS; p++) {
+    const py = platY(p);
+    const c = PLAT_COLORS[p % PLAT_COLORS.length];
+    rect(0, py, W, 2, c);
+    for (const h of holes[p]) {
+      const hx = Math.floor(h.x);
+      // Clear hole
+      rect(hx, py - 1, HOLE_WIDTH, 4, COL.BLACK);
+      // Edge markers
+      rect(hx, py, 1, 2, COL.BWHITE);
+      rect(hx + HOLE_WIDTH - 1, py, 1, 2, COL.BWHITE);
+    }
+  }
+
+  // Bottom floor (solid)
+  rect(0, BOTTOM_Y, W, 2, COL.BWHITE);
+
+  // Hazards
+  for (const hz of hazards) drawHazard(hz);
+
+  // Jack
+  drawJack(Math.floor(jack.x), Math.floor(jackY()));
+
+  // Floor indicator (which floor Jack is on)
+  const floorLabel = jack.floor === 0 ? 'TOP!' : jack.floor >= NUM_FLOORS ? 'GND' : '' + (NUM_FLOORS - jack.floor);
+  text('F:' + floorLabel, 2, H - 4, COL.BCYAN, 6);
+
+  // Level complete overlay
+  if (gameState === 'levelcomplete') {
+    rect(40, H/2 - 20, W - 80, 36, COL.BLUE);
+    rect(42, H/2 - 18, W - 84, 32, COL.BLACK);
+    textC('LEVEL COMPLETE!', H/2 - 6, COL.BYELLOW, 9);
+    textC('BONUS: ' + (100 * level) + ' PTS', H/2 + 10, COL.BGREEN, 7);
+  }
+}
+
+function drawTitle() {
+  // Border decoration
+  rect(0, 0, W, 3, COL.BRED);
+  rect(0, H-3, W, 3, COL.BRED);
+  rect(0, 0, 3, H, COL.BRED);
+  rect(W-3, 0, 3, H, COL.BRED);
+
+  textC('JUMPING', 36, COL.BYELLOW, 16);
+  textC('JACK', 56, COL.BYELLOW, 16);
+  textC('ZX Spectrum 1983', 70, COL.BCYAN, 6);
+
+  // Animated demo platforms
+  for (let i = 0; i < 5; i++) {
+    const y = 82 + i * 15;
+    const c = PLAT_COLORS[i];
+    rect(30, y, W - 60, 2, c);
+    const hx = ((Date.now() / 18 + i * 60) % (W - 60));
+    rect(30 + hx, y - 1, HOLE_WIDTH, 4, COL.BLACK);
+  }
+
+  // Animated Jack on title
+  const tjx = 128 + Math.sin(Date.now() / 600) * 40;
+  const tjy = 82 + 4 * 15;
+  const saveS = jack.state, saveD = jack.dir;
+  jack.state = 'walk'; jack.dir = Math.cos(Date.now() / 600) > 0 ? 1 : -1;
+  drawJack(Math.floor(tjx), tjy);
+  jack.state = saveS; jack.dir = saveD;
+
+  textC('CONTROLS', 155, COL.BGREEN, 7);
+  textC('\u2190 \u2192  Move    SPACE/\u2191  Jump', 167, COL.WHITE, 6);
+
+  if (Math.floor(Date.now() / 400) % 2 === 0) {
+    textC('PRESS SPACE TO START', 184, COL.BYELLOW, 8);
+  } else {
+    textC('PRESS SPACE TO START', 184, COL.BWHITE, 8);
+  }
+}
+
+function drawGameOver() {
+  rect(0, 0, W, 3, COL.BRED);
+  rect(0, H-3, W, 3, COL.BRED);
+
+  textC('GAME OVER', 55, COL.BRED, 16);
+  textC('SCORE: ' + score, 85, COL.BYELLOW, 10);
+  textC('HIGH SCORE: ' + highScore, 108, COL.BGREEN, 8);
+  textC('LEVEL REACHED: ' + level, 125, COL.BCYAN, 8);
+
+  if (Math.floor(Date.now() / 400) % 2 === 0) {
+    textC('PRESS SPACE', 165, COL.BYELLOW, 8);
+  } else {
+    textC('PRESS SPACE', 165, COL.BWHITE, 8);
+  }
+}
+
+// ---- Main Loop ----
+function gameLoop() {
+  update();
+  render();
+  requestAnimationFrame(gameLoop);
+}
+gameLoop();
+</script>
+</body>
+</html>
